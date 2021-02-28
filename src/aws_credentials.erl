@@ -37,12 +37,17 @@
 -export([start_link/0
         ,stop/0
         ,get_credentials/0
+        ,force_credentials_refresh/0
+        ,force_credentials_refresh/1
         ,make_map/3
         ,make_map/4
         ,make_map/5
         ]).
 
--record(state, {credentials = undefined :: map() | undefined | information_redacted}).
+-record(state, {
+          credentials = undefined :: map() | undefined | information_redacted,
+          tref = undefined :: reference() | undefined
+         }).
 
 %%====================================================================
 %% API
@@ -71,24 +76,40 @@ start_link() ->
 stop() ->
     gen_server:stop(?MODULE).
 
-%% @doc Get the client built with data fetched from the instance metadata
-%% service.
+%% @doc Get cached credential information.
 get_credentials() ->
     gen_server:call(?MODULE, get_credentials).
+
+%% @doc Force a credentials update (using the application environment
+%% options if any).
+force_credentials_refresh() ->
+    ProviderOptions = application:get_env(aws_credentials, provider_options, []),
+    force_credentials_refresh(ProviderOptions).
+
+%% @doc Force a credentials update, passing options (which possibly override
+%% the options set in the erlang environment.)
+-spec force_credentials_refresh( Options :: proplists:proplist() ) -> map() | {error, Reason :: term()}.
+force_credentials_refresh(Options) ->
+    gen_server:call(?MODULE, {force_refresh, Options}).
 
 %%====================================================================
 %% Behaviour
 %%====================================================================
 
 init(_Args) ->
-    {ok, C} = fetch_credentials(),
-    {ok, #state{credentials=C}}.
+    ProviderOptions = application:get_env(aws_credentials, provider_options, []),
+    {ok, C, T} = fetch_credentials(ProviderOptions),
+    {ok, #state{credentials=C, tref=T}}.
 
 terminate(_Reason, _State) ->
     ok.
 
 handle_call(get_credentials, _From, State=#state{credentials=C}) ->
     {reply, C, State};
+handle_call({force_refresh, Options}, _From, State=#state{tref=T}) ->
+    {ok, C, NewT} = fetch_credentials(Options),
+    erlang:cancel_timer(T),
+    {reply, C, State#state{credentials=C, tref=NewT}};
 handle_call(Args, _From, State) ->
     error_logger:warning_msg("Unknown call: ~p~n", [Args]),
     {noreply, State}.
@@ -98,8 +119,9 @@ handle_cast(Message, State) ->
     {noreply, State}.
 
 handle_info(refresh_credentials, State) ->
-    {ok, C} = fetch_credentials(),
-    {noreply, State#state{credentials=C}};
+    ProviderOptions = application:get_env(aws_credentials, provider_options, []),
+    {ok, C, T} = fetch_credentials(ProviderOptions),
+    {noreply, State#state{credentials=C, tref=T}};
 handle_info(Message, State) ->
     error_logger:warning_msg("Unknown message: ~p~n", [Message]),
     {noreply, State}.
@@ -114,12 +136,12 @@ format_status(_, [_PDict, State]) ->
 %% Internal functions
 %%====================================================================
 
-fetch_credentials() ->
+fetch_credentials(Options) ->
     ShouldCatch = not application:get_env(aws_credentials, fail_if_unavailable, true),
     try
-        {ok, Client, ExpirationTime} = aws_credentials_provider:fetch(),
-        setup_update_callback(ExpirationTime),
-        {ok, Client}
+        {ok, Creds, ExpirationTime} = aws_credentials_provider:fetch(Options),
+        Tref = setup_update_callback(ExpirationTime),
+        {ok, Creds, Tref}
     ?CATCH
             error_logger:info_msg("aws_credentials ignoring exception ~p:~p (~p)~n",
                                   [E,R,ST]),
